@@ -1,0 +1,41 @@
+{
+  "_comment": "替换为实际文件名或输入相对路径（/ 分隔），看过原图后填写设置和 reason。以下是不同场景的用法示例，不按文件顺序分配风格。显式 adjustments 覆盖预设，不再乘 strength；temperature/tint 是 RGB 曲线偏移，不是开尔文色温。",
+  "portrait.jpg": {
+    "mode": "natural",
+    "strength": 0.8,
+    "adjustments": {"vibrance": 10, "temperature": 0, "tint": 0},
+    "reason": "主体稍暗，适度改善层次，保留肤色与中性色"
+  },
+  "interior.jpg": {
+    "mode": "clean",
+    "strength": 0.9,
+    "adjustments": {"vibrance": 12},
+    "reason": "室内主体偏暗，需要更明亮的中间调；白墙保持中性"
+  },
+  "trip/landscape.jpg": {
+    "mode": "vivid",
+    "strength": 0.75,
+    "reason": "风景灰淡，希望更清楚的层次；复查绿叶和天空不过饱和"
+  },
+  "sunset.jpg": {
+    "mode": "warm",
+    "strength": 0.65,
+    "adjustments": {"vibrance": 8, "temperature": 7},
+    "reason": "夕阳本来偏暖，适度强化暖光；保留中性色与高光层次"
+  },
+  "film-look.jpg": {
+    "mode": "film",
+    "strength": 0.7,
+    "reason": "用户明确需要柔和胶片感，接受抬黑与降低彩度"
+  },
+  "bright-scene.jpg": {
+    "curves": [{"ch": 0, "pts": [[0, 0], [32, 34], [64, 71], [128, 135], [192, 189], [224, 217], [255, 255]]}],
+    "adjustments": {"vibrance": 8},
+    "reason": "逐张提亮主体中间调并轻压高光，保留明亮场景氛围"
+  },
+  "legacy-tone.jpg": {
+    "tone": [0, 255, 1.06, 1.03],
+    "adjustments": {"vibrance": 5},
+    "reason": "兼容旧格式的轻微提亮，用实机成品检查细节与剪裁"
+  }
+}
