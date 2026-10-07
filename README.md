@@ -1,9 +1,11 @@
 # photoshop-skill
 
-用 Windows 本机已安装的 **Adobe Photoshop**，为 JPEG 照片做色调 / 色彩调色：通过 COM/JSX 驱动**真实 Photoshop**（不是模拟），自动分析照片曝光与色彩，套用自适应曲线与风格预设，导出独立副本，并生成**前后对比图**与**技术风险报告**。
+用 Windows 本机已安装的 **Adobe Photoshop**，为照片做色调 / 色彩调色：通过 COM/JSX 驱动**真实 Photoshop**（不是模拟），自动分析曝光与色彩，套用自适应曲线与风格预设，导出独立副本，并生成**前后对比图**与**技术风险报告**。
 
-> Skill 标识为 `photoshop-skill`。适用于 Photoshop 修图、照片美化、批量调色、逐张参数、加前后缀导出。
-> 不提供抠图、合成、RAW 开发或通用人像精修。
+支持输入 **JPEG / PNG / TIFF / BMP / WebP**，以及解码器支持的**相机 RAW**（经 rawpy 解码为统一的 16 位 sRGB 基线）；PNG / TIFF 可保留透明度与 8/16 位精度。
+
+> Skill 标识为 `photoshop-skill`。适用于照片美化、批量调色、逐张参数、加前后缀导出。
+> 不提供抠图、合成、交互式 RAW 开发或通用人像精修。
 
 ---
 
@@ -14,8 +16,10 @@
 - **色彩**：自然饱和度 / 饱和度独立控制；可选冷暖（`temperature` / `tint`，RGB 曲线偏移，非开尔文）。
 - **风格预设**：`auto` / `natural` / `clean` / `vivid` / `warm` / `film`。
 - **逐张参数**：用 `jobs.json` 给每张照片单独指定模式、强度、调整与 `reason`；同样内容的照片可分组，明显不同的逐张处理。
-- **安全输出**：嵌入 sRGB、Photoshop 自动应用 EXIF 方向、默认**不覆盖源图**；同名 `.jpg`/`.jpeg` 冲突会报错。
-- **导出即复查**：每次导出生成 `comparison_*.png` 与 `review.json`，标注剪裁、偏色、过饱和、尺寸 / ICC 等技术风险（**技术提示，不是审美分数**）。
+- **多格式与 RAW**：JPEG / PNG / TIFF / BMP / WebP + 相机 RAW；`--format auto|jpg|png|tiff` 控制输出，auto 按输入保留格式（RAW/TIFF→TIFF，BMP/WebP→PNG）。
+- **透明度与位深**：曝光 / 彩度统计排除全透明像素；PNG / TIFF 保留 Alpha 与 8/16 位，JPEG 最后合成白底转 8 位；PNG 导出补写 sRGB iCCP 配置块。
+- **安全输出**：嵌入 sRGB、Photoshop 自动应用方向、默认**不覆盖源图**；不同源图映射到同一输出路径（如同名 `.jpg`/`.jpeg`）会报错，并拒绝 32 位 HDR 与多帧 / 多页文件。
+- **导出即复查**：每次导出生成 `comparison_*.png` 与 `review.json`，标注剪裁、偏色、过饱和、尺寸 / ICC，以及适用时的**透明度与位深**等技术风险（**技术提示，不是审美分数**）。
 
 ---
 
@@ -28,6 +32,12 @@
 
 ```powershell
 pip install Pillow pywin32
+```
+
+相机 RAW 还需同一解释器中的 `rawpy numpy tifffile`（未安装时普通图片仍可处理）：
+
+```powershell
+python -m pip install rawpy numpy tifffile
 ```
 
 ---
@@ -64,6 +74,9 @@ python scripts\photoshop_tone.py "C:\photos" --out "C:\exports" --jobs examples\
 
 # 原图旁生成副本，加后缀并开启严格技术检查
 python scripts\photoshop_tone.py "C:\photos" --prefix "" --suffix "_edited" --strict-review
+
+# 指定输出格式（auto 默认；可显式 jpg / png / tiff）
+python scripts\photoshop_tone.py "C:\photos" --out "C:\exports" --format png
 ```
 
 ---
@@ -74,7 +87,8 @@ python scripts\photoshop_tone.py "C:\photos" --prefix "" --suffix "_edited" --st
 | --- | --- |
 | `--out DIR` | 输出根目录（默认与输入相同） |
 | `--prefix P_` / `--suffix ""` | 输出文件名前后缀（默认前缀 `P_`） |
-| `--quality 1..12` | JPEG 质量，默认 `12` |
+| `--format auto\|jpg\|png\|tiff` | 输出格式，默认 `auto`（按输入保留格式）；见下表 |
+| `--quality 1..12` | JPEG 质量（仅 JPEG 输出），默认 `12` |
 | `--mode MODE` | 风格预设，见下表 |
 | `--strength 0..1.5` | 自动效果强度，默认 `1`；`0` 关闭自动曲线与预设色彩 |
 | `--jobs FILE` | 逐张参数 JSON，匹配项覆盖该照片的命令行风格 / 强度 |
@@ -88,6 +102,18 @@ python scripts\photoshop_tone.py "C:\photos" --prefix "" --suffix "_edited" --st
 | `--quit` / `--keep-open` | 退出 / 保留本次启动的 Photoshop 会话（互斥） |
 
 **退出码**：`0` 成功或全部跳过；`1` 运行失败、无源图或 strict-review 触发；`2` 配置 / 输入不合法。
+
+`--format auto` 输出映射：
+
+| 输入 | auto 输出 |
+| --- | --- |
+| JPEG（`.jpg` / `.jpeg`） | `.jpg` |
+| PNG | `.png`，保留透明度 |
+| TIFF（`.tif` / `.tiff`） | `.tif`，保留支持的 8/16 位与透明度 |
+| 相机 RAW | `.tif`，16 位 sRGB 解码基线 |
+| BMP / WebP | `.png`，保留存在的透明度 |
+
+显式 `jpg` 会在最终导出前把透明区域合成到白底并转 8 位；需要透明度或 16 位时选 `png` / `tiff`。`--quality` 仅控制 JPEG。
 
 ---
 
@@ -146,7 +172,7 @@ python scripts\photoshop_tone.py "C:\photos" --prefix "" --suffix "_edited" --st
 
 ## 输出与会话安全
 
-- 默认在原图旁保存 `P_<stem>.jpg`；`--out` 改输出根目录；`--recursive` 保留相对子目录。
+- 默认在原图旁保存 `P_<stem>`，扩展名由输出格式决定；`--out` 改输出根目录；`--recursive` 保留相对子目录。
 - 已有输出默认跳过，`--overwrite` 才替换；**任何情况下输出不能覆盖源图**。
 - 脚本保护已在 Photoshop 打开的源图，恢复原对话框设置与活动文档，只关闭本次打开的文档。
 - 本次启动的 PS 在完成后正常退出；原有会话默认保留。故障排查见 [`reference/gotchas.md`](reference/gotchas.md)。
@@ -159,23 +185,27 @@ python scripts\photoshop_tone.py "C:\photos" --prefix "" --suffix "_edited" --st
 python -X utf8 -m unittest discover -s tests -v
 python tests\smoke_photoshop.py
 python tests\smoke_photo_grading.py
+python tests\smoke_photo_formats.py
 python tests\smoke_photoshop_exit.py
 ```
 
-单元测试不启动 PS；实机脚本检查真实导出像素、调色、ICC、方向及会话清理。
+单元测试不启动 PS；实机脚本检查真实导出像素、调色、格式、透明度、位深、ICC、方向及会话清理。
 
 ---
 
 ## 仓库结构
 
 ```
-SKILL.md                    技能主文档（判断与检查流程、命令、风格）
-reference/color-grading.md  按照片内容选择调色的参考
-reference/gotchas.md        故障排查
-scripts/photoshop_tone.py   主脚本：分析 + COM/JSX 驱动 Photoshop
-scripts/photo_review.py     前后对比与技术风险报告
-examples/jobs.example.json  逐张参数示例
-tests/                      单元测试与实机冒烟测试
+SKILL.md                      技能主文档（判断与检查流程、命令、风格）
+reference/color-grading.md    按照片内容选择调色的参考
+reference/photo-formats.md    输入格式、透明度与 RAW 说明
+reference/gotchas.md          故障排查
+scripts/photoshop_tone.py     主脚本：分析 + COM/JSX 驱动 Photoshop
+scripts/photo_formats.py      格式探测、RAW 解码、输出格式选择
+scripts/png_profiles.py       PNG 导出补写 sRGB iCCP
+scripts/photo_review.py       前后对比与技术风险报告
+examples/jobs.example.json    逐张参数示例
+tests/                        单元测试与实机冒烟测试
 ```
 
 ## 许可证

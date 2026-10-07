@@ -5,22 +5,23 @@ Uses Adobe Photoshop's Windows COM automation and ExtendScript.
 
 Pipeline
 --------
-1. Preview and analyse tone, saturation and clipping with Pillow.
+1. Prepare supported photos (camera RAW to a fixed 16-bit TIFF), then analyse.
 2. Combine adaptive exposure with per-photo look and explicit colour choices.
 3. Build a JSX script and execute it through Photoshop's COM `DoJavaScript`.
 4. Each image is opened (Photoshop auto-applies EXIF orientation), converted to
-   sRGB, given one Curves adjustment layer per channel, then saved as a JPEG
+   sRGB, given one Curves adjustment layer per channel, then saved as a photo
    copy, then write before/after comparisons and a technical-risk report.
 
 Usage
 -----
     python photoshop_tone.py INPUT_DIR [--out DIR] [--prefix P_] [--suffix ""]
-                                  [--quality 12] [--mode MODE] [--strength 0..1.5]
+                                  [--format auto|jpg|png|tiff] [--quality 12]
+                                  [--mode MODE] [--strength 0..1.5]
                                   [--jobs jobs.json] [--recursive] [--limit N]
                                   [--dry-run|--preview-only] [--review-dir DIR]
                                   [--strict-review] [--overwrite] [--quit|--keep-open]
 
-Requires: pywin32, Pillow  (pip install pywin32 Pillow)
+Requires: pywin32, Pillow; camera RAW additionally needs rawpy, numpy, tifffile.
 """
 
 from __future__ import annotations
@@ -33,12 +34,11 @@ import sys
 import time
 from collections import Counter
 from dataclasses import dataclass, field
-from io import BytesIO
 from typing import Optional
 from urllib.parse import unquote
 
 try:
-    from PIL import Image, ImageCms, ImageOps, ImageStat
+    from PIL import Image, ImageStat
 except ImportError:  # pragma: no cover
     sys.stderr.write("Pillow is required: pip install Pillow\n")
     raise
@@ -52,7 +52,8 @@ PHOTOSHOP_PROGID = "Photoshop.Application"
 # HResult raised when Photoshop is busy (a modal dialog / long task). Retry.
 RPC_E_SERVERCALL_RETRYLATER = -2147417846
 
-IMAGE_EXTS = {".jpg", ".jpeg"}
+from photo_formats import (IMAGE_EXTS, RAW_EXTS, PhotoSources, choose_output_format,
+                           output_extension, read_preview)
 
 # Creative looks are separate from exposure diagnosis. Neutral is the default.
 MODES = {
@@ -73,28 +74,30 @@ def clamp(v, lo, hi):
 # Histogram analysis (Pillow)
 # ---------------------------------------------------------------------------
 
-def load_rgb(path: str, sample: int = 512):
-    """ICC-aware, orientation-correct thumbnail detached from its source file."""
-    with Image.open(path) as im:
-        im = ImageOps.exif_transpose(im)
-        if im.info.get("icc_profile"):
-            try:
-                im = ImageCms.profileToProfile(
-                    im, ImageCms.ImageCmsProfile(BytesIO(im.info["icc_profile"])),
-                    ImageCms.createProfile("sRGB"), renderingIntent=1, outputMode="RGB")
-            except ImageCms.PyCMSError as exc:
-                raise ValueError("Cannot convert embedded ICC profile: {0}".format(exc)) from exc
-        else:
-            im = im.convert("RGB")
-        im.thumbnail((sample, sample), Image.Resampling.LANCZOS)
-        return im.copy()
+def load_rgb(path: str, sample: int = 512, background: str = "#eeeeee"):
+    """Display thumbnail, compositing transparency on the same neutral backdrop."""
+    rgb, alpha, _ = read_preview(path, sample)
+    if alpha is not None:
+        backdrop = Image.new("RGB", rgb.size, background)
+        backdrop.paste(rgb, mask=alpha)
+        return backdrop
+    return rgb
 
 
 def analyze_image(path: str, sample: int = 512) -> dict:
     """Measure tone/colour risk; these statistics are not an aesthetic score."""
-    im = load_rgb(path, sample)
-    hist = im.convert("L").histogram()
-    mean_r, mean_g, mean_b = ImageStat.Stat(im).mean
+    im, alpha, metadata = read_preview(path, sample)
+    return analyze_pixels(im, metadata, alpha)
+
+
+def analyze_pixels(im, metadata: dict, alpha=None) -> dict:
+    """Measure a prepared RGB thumbnail, optionally ignoring transparent pixels."""
+    # Hidden RGB values in fully transparent pixels must not determine the grade.
+    mask = alpha.point(lambda a: 255 if a else 0) if alpha is not None else None
+    hist = im.convert("L").histogram(mask=mask)
+    if not sum(hist):
+        raise ValueError("Image is completely transparent; no visible photo to grade")
+    mean_r, mean_g, mean_b = ImageStat.Stat(im, mask=mask).mean
 
     n = sum(hist)
     targets = {"p01": 0.01, "p05": 0.05, "p25": 0.25, "p50": 0.50,
@@ -115,18 +118,16 @@ def analyze_image(path: str, sample: int = 512) -> dict:
     out["meanB"] = round(mean_b, 1)
     out["mean"] = round((mean_r + mean_g + mean_b) / 3.0, 1)
     out["meanL"] = round(sum(i * count for i, count in enumerate(hist)) / n, 2)
-    sat = im.convert("HSV").getchannel("S").histogram()
+    sat = im.convert("HSV").getchannel("S").histogram(mask=mask)
     out["meanSaturation"] = round(sum(i * count for i, count in enumerate(sat)) / (n * 255), 4)
     out["saturatedFraction"] = round(sum(sat[245:]) / n, 5)
     out["shadowClip"] = round(sum(hist[:4]) / n, 5)
     out["highlightClip"] = round(sum(hist[252:]) / n, 5)
     out["channelClip"] = {
-        label: round((sum(ch.histogram()[:2]) + sum(ch.histogram()[254:])) / n, 5)
+        label: round((sum(ch.histogram(mask=mask)[:2]) + sum(ch.histogram(mask=mask)[254:])) / n, 5)
         for label, ch in zip(("red", "green", "blue"), im.split())
     }
-    with Image.open(path) as original:
-        out["size"] = list(ImageOps.exif_transpose(original).size)
-        out["hasICC"] = bool(original.info.get("icc_profile"))
+    out.update(metadata)
     return out
 
 
@@ -388,20 +389,22 @@ function _vibrance(amount, saturation){
   executeAction(sT("make"), desc, DialogModes.NO);
   app.activeDocument.activeLayer.name = "Colour - Vibrance";
 }
-function _process(srcPath, outPath, quality, curveSpecs, colour, luminanceOnly, overwrite, log){
+function _process(srcPath, inputPath, outPath, format, quality, curveSpecs, colour, luminanceOnly, overwrite, log){
   var doc = null;
   try {
-    var srcFile = new File(srcPath), outFile = new File(outPath);
+    var srcFile = new File(srcPath), inputFile = new File(inputPath), outFile = new File(outPath);
     if (!overwrite && outFile.exists) throw new Error("Output already exists");
     for (var d=0; d<app.documents.length; d++){
       var openPath = null;
       try { openPath = app.documents[d].fullName.fsName; } catch(noPath){}
-      if (openPath && openPath.toLowerCase() == srcFile.fsName.toLowerCase())
+      if (openPath && (openPath.toLowerCase() == srcFile.fsName.toLowerCase() ||
+                       openPath.toLowerCase() == inputFile.fsName.toLowerCase()))
         throw new Error("Source is already open in Photoshop; close it before batching");
     }
-    doc = app.open(srcFile);
+    doc = app.open(inputFile);
     if (doc.mode != DocumentMode.RGB) doc.changeMode(ChangeMode.RGB);
-    doc.bitsPerChannel = BitsPerChannelType.EIGHT;
+    if (doc.bitsPerChannel == BitsPerChannelType.THIRTYTWO)
+      throw new Error("32-bit HDR input is not supported by this photo grading workflow");
     doc.convertProfile("sRGB IEC61966-2.1", Intent.RELATIVECOLORIMETRIC, true, true);
     for (var c=0;c<curveSpecs.length;c++){
       _curves(curveSpecs[c][0], curveSpecs[c][1]);
@@ -411,9 +414,28 @@ function _process(srcPath, outPath, quality, curveSpecs, colour, luminanceOnly, 
       } else { doc.activeLayer.name = "Colour - Channel " + curveSpecs[c][0]; }
     }
     if (colour.vibrance || colour.saturation) _vibrance(colour.vibrance || 0, colour.saturation || 0);
-    var opts = new JPEGSaveOptions();
-    opts.quality = quality;
-    opts.embedColorProfile = true;
+    // Bake the grade while preserving transparency; only JPEG requires flattening.
+    if (doc.layers.length > 1) doc.mergeVisibleLayers();
+    var opts;
+    if (format == "jpg") {
+      if (!doc.activeLayer.isBackgroundLayer) {
+        var bottom = doc.layers[doc.layers.length - 1];
+        var backdrop = doc.artLayers.add();
+        backdrop.name = "JPEG white backdrop";
+        backdrop.move(bottom, ElementPlacement.PLACEAFTER);
+        doc.activeLayer = backdrop;
+        var white = new SolidColor(); white.rgb.red = white.rgb.green = white.rgb.blue = 255;
+        doc.selection.selectAll(); doc.selection.fill(white); doc.selection.deselect();
+      }
+      doc.flatten();
+      doc.bitsPerChannel = BitsPerChannelType.EIGHT;
+      opts = new JPEGSaveOptions(); opts.quality = quality; opts.embedColorProfile = true;
+    } else if (format == "png") {
+      opts = new PNGSaveOptions(); opts.interlaced = false;
+    } else if (format == "tiff") {
+      opts = new TiffSaveOptions(); opts.imageCompression = TIFFEncoding.TIFFLZW;
+      opts.embedColorProfile = true; opts.layers = false; opts.transparency = true;
+    } else { throw new Error("Unsupported output format: " + format); }
     doc.saveAs(outFile, opts, true, Extension.LOWERCASE);
     doc.close(SaveOptions.DONOTSAVECHANGES);
     doc = null;
@@ -440,11 +462,15 @@ try {
 app.displayDialogs = DialogModes.NO;
 """]
     for job in jobs:
+        if (os.path.splitext(job["src"])[1].lower() in RAW_EXTS
+                and (not job.get("input_src") or path_key(job["input_src"]) == path_key(job["src"]))):
+            raise ValueError("RAW must be prepared as a decoded TIFF before Photoshop processing")
         settings = validate_adjustments(job.get("adjustments", {}))
         specs = [[c["ch"], c["pts"]] for c in job["curves"] + colour_curves(settings)]
         parts.append(
-            "_process({0}, {1}, {2}, {3}, {4}, {5}, {6}, _log);\n".format(
-                js_lit(job["src"]), js_lit(job["out"]), int(quality), js_lit(specs),
+            "_process({0}, {1}, {2}, {3}, {4}, {5}, {6}, {7}, {8}, _log);\n".format(
+                js_lit(job["src"]), js_lit(job.get("input_src") or job["src"]), js_lit(job["out"]),
+                js_lit(job.get("format", "jpg")), int(quality), js_lit(specs),
                 js_lit(settings), js_lit(job.get("luminance_only", False)), js_lit(overwrite)
             )
         )
@@ -559,6 +585,9 @@ class Job:
     summary: dict = field(default_factory=dict)
     stats: dict = field(default_factory=dict)
     status: str = "planned"
+    input_src: Optional[str] = None
+    format: str = "jpg"
+    source_metadata: dict = field(default_factory=dict)
 
 
 def is_within(path: str, folder: str) -> bool:
@@ -600,9 +629,9 @@ def collect_images(folder: str, recursive: bool, prefix: str, suffix: str,
     return result
 
 
-def out_name(base: str, prefix: str, suffix: str) -> str:
+def out_name(base: str, prefix: str, suffix: str, format: str = "jpg") -> str:
     stem = os.path.splitext(base)[0]
-    return "{0}{1}{2}.jpg".format(prefix, stem, suffix)
+    return "{0}{1}{2}{3}".format(prefix, stem, suffix, output_extension(format))
 
 
 def parse_args(argv=None):
@@ -612,6 +641,8 @@ def parse_args(argv=None):
     ap.add_argument("--prefix", default="P_", help="filename prefix for outputs (default: P_)")
     ap.add_argument("--suffix", default="", help="filename suffix for outputs (default: none)")
     ap.add_argument("--quality", type=int, default=12, help="JPEG quality 1-12 (default 12)")
+    ap.add_argument("--format", default="auto", choices=("auto", "jpg", "png", "tiff"),
+                    help="export format; auto preserves PNG/TIFF and renders RAW to 16-bit TIFF")
     ap.add_argument("--mode", default="auto", choices=sorted(MODES.keys()))
     ap.add_argument("--strength", type=float, default=1.0, help="automatic look intensity 0..1.5 (default 1)")
     ap.add_argument("--jobs", default=None, help="JSON file of per-image parameters")
@@ -629,6 +660,12 @@ def parse_args(argv=None):
 
 
 def main(argv=None) -> int:
+    # Lazily create private decoded inputs; keep them alive through export and review.
+    with PhotoSources() as sources:
+        return _main(argv, sources)
+
+
+def _main(argv, sources) -> int:
     args = parse_args(argv)
     if not 1 <= args.quality <= 12:
         sys.stderr.write("--quality must be between 1 and 12\n")
@@ -689,7 +726,8 @@ def main(argv=None) -> int:
         base = os.path.basename(src)
         relative = os.path.relpath(os.path.dirname(src), input_dir)
         dst_dir = os.path.join(out_dir, relative)
-        dst = os.path.join(dst_dir, out_name(base, args.prefix, args.suffix))
+        format = choose_output_format(src, args.format)
+        dst = os.path.join(dst_dir, out_name(base, args.prefix, args.suffix, format))
         dst_key = path_key(dst)
         dst_stat = os.stat(dst) if os.path.exists(dst) else None
         if (dst_key in source_keys or (dst_stat is not None
@@ -709,12 +747,19 @@ def main(argv=None) -> int:
         try:
             if key == base and key in manual and basenames[base] > 1:
                 raise ValueError("ambiguous jobs key; use input-relative paths such as subfolder/name.jpg")
-            stats = analyze_image(src)
+            prepared = sources.prepare(src, dry_run=args.dry_run)
+            stats = analyze_image(prepared.path)
             curves, summary = normalize_job(manual.get(key, {}), stats, args.mode, args.strength)
+            summary["export"] = {"format": format, "bitDepth": 8 if format == "jpg" else max(8, stats["bitDepth"]),
+                                 "transparency": "white_backdrop" if format == "jpg" and stats.get("hasAlpha")
+                                 else "preserve" if stats.get("hasAlpha") else "opaque"}
+            if format == "jpg" and stats.get("hasAlpha"):
+                print("JPEG export will composite transparency on white: " + src)
         except (OSError, ValueError) as exc:
             sys.stderr.write("Cannot prepare {0}: {1}\n".format(src, exc))
             return 2
-        jobs.append(Job(src=src, out=dst, curves=curves, summary=summary, stats=stats))
+        jobs.append(Job(src=src, out=dst, curves=curves, summary=summary, stats=stats,
+                        input_src=prepared.path, format=format, source_metadata=prepared.metadata))
 
     if not jobs:
         print("No new images to process ({0} existing output(s) skipped).".format(skipped))
@@ -738,7 +783,7 @@ def main(argv=None) -> int:
     # Diagnostics must never overwrite a source or any intended export.
     from photo_review import validate_review_paths, write_review
     try:
-        validate_review_paths(review_dir, jobs)
+        validate_review_paths(review_dir, jobs, source_keys=source_keys, source_ids=source_ids)
         if args.preview_only:
             report, _ = write_review(jobs, review_dir, preview=True)
             print("Source previews and plan: " + report)
@@ -755,7 +800,8 @@ def main(argv=None) -> int:
             os.makedirs(os.path.dirname(job.out), exist_ok=True)
         started_here = not photoshop_is_running()
         app = connect_photoshop()
-        jsx = build_jsx([{"src": j.src, "out": j.out, "curves": j.curves,
+        jsx = build_jsx([{"src": j.src, "input_src": j.input_src, "out": j.out,
+                          "format": j.format, "curves": j.curves,
                           "adjustments": j.summary.get("adjustments", {}),
                           "luminance_only": j.summary.get("mode") != "manual"} for j in jobs],
                         args.quality, args.overwrite)
@@ -766,6 +812,15 @@ def main(argv=None) -> int:
         failures = 0
         for job, line in zip(jobs, lines):
             if line == "OK" and os.path.isfile(job.out) and os.path.getsize(job.out) > 0:
+                if job.format == "png":
+                    from png_profiles import embed_srgb_profile
+                    try:
+                        embed_srgb_profile(job.out)
+                    except (OSError, ValueError) as exc:
+                        job.status = "failed"
+                        failures += 1
+                        print("ERR PNG profile could not be embedded: {0}: {1}".format(job.out, exc), file=sys.stderr)
+                        continue
                 job.status = "exported"
                 print("OK  {0} -> {1}".format(job.src, job.out))
             elif line == "OK":

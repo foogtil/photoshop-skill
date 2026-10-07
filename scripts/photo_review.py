@@ -21,23 +21,37 @@ def artifact_paths(folder, count, preview=False):
                                      for i in range(math.ceil(count / PAGE_SIZE))]
 
 
-def validate_review_paths(folder, jobs):
-    reserved = {tone.path_key(j.src) for j in jobs} | {tone.path_key(j.out) for j in jobs}
+def validate_review_paths(folder, jobs, *, source_keys=None, source_ids=None):
+    reserved = ({tone.path_key(j.src) for j in jobs} | {tone.path_key(j.out) for j in jobs}
+                | set(source_keys or ()))
+    protected_ids = set(source_ids or ())
+    for job in jobs:
+        for original in (job.src, job.out):
+            if os.path.isfile(original):
+                stat = os.stat(original)
+                protected_ids.add((stat.st_dev, stat.st_ino))
     for path in artifact_paths(folder, len(jobs), False) + artifact_paths(folder, len(jobs), True):
         if tone.path_key(str(path)) in reserved:
             raise ValueError("review artifacts would replace a source/export: " + str(path))
+        if path.exists() and protected_ids:
+            stat = path.stat()
+            if (stat.st_dev, stat.st_ino) in protected_ids:
+                raise ValueError("review artifact is a hard link to an original source: " + str(path))
     if os.path.isfile(folder):
         raise ValueError("review directory is a file: " + folder)
 
 
-def _neutral_shift(before, after):
+def _neutral_shift(before, after, mask=None):
     """Compare the same neutral source pixels; do not infer white balance from whole-image means."""
     if before.size != after.size:
         return None
     source, result = [], []
     data_a = before.get_flattened_data() if hasattr(before, "get_flattened_data") else before.getdata()
     data_b = after.get_flattened_data() if hasattr(after, "get_flattened_data") else after.getdata()
+    visible = iter(mask.get_flattened_data() if hasattr(mask, "get_flattened_data") else mask.getdata()) if mask else None
     for a, b in zip(data_a, data_b):
+        if visible is not None and not next(visible):
+            continue
         if max(a) - min(a) <= 10 and 48 <= sum(a) / 3 <= 235:
             source.append(a)
             result.append(b)
@@ -79,20 +93,42 @@ def assess_pair(source_stats, result_stats, *, change=0.0, neutral_shift=None,
 
 
 def review_pair(job):
-    before_stats = job.stats or tone.analyze_image(job.src)
+    baseline = job.input_src or job.src
+    before_stats = job.stats or tone.analyze_image(baseline)
     after_stats = tone.analyze_image(job.out)
-    before = tone.load_rgb(job.src)
+    before = tone.load_rgb(baseline, background="#ffffff" if job.format == "jpg" else "#eeeeee")
     after = tone.load_rgb(job.out)
-    shift = _neutral_shift(before, after)
+    _, source_alpha, source_info = tone.read_preview(baseline)
+    _, result_alpha, _ = tone.read_preview(job.out)
+    if source_alpha is not None and job.format == "jpg":
+        # White is an intentional format conversion, not newly clipped photo detail.
+        source_info = dict(source_info, hasAlpha=False)
+        before_stats = tone.analyze_pixels(before, source_info)
+    visible = source_alpha.point(lambda a: 255 if a else 0) if source_alpha is not None else None
+    shift = _neutral_shift(before, after, visible)
     # Mean pixel change only detects a near-identity export; it is not a quality rating.
     resized = after.resize(before.size, Image.Resampling.LANCZOS)
     from PIL import ImageChops
-    change = round(sum(ImageStat.Stat(ImageChops.difference(before, resized)).mean) / 3, 3)
+    change = round(sum(ImageStat.Stat(ImageChops.difference(before, resized), mask=visible).mean) / 3, 3)
     colour = job.summary.get("adjustments", {})
     warnings = assess_pair(before_stats, after_stats, change=change, neutral_shift=shift,
                            intentional_tint=bool(colour.get("temperature") or colour.get("tint")),
                            strength=job.summary.get("strength", 1))
+    expected_bits = job.summary.get("export", {}).get("bitDepth", before_stats.get("bitDepth", 8))
+    if after_stats.get("bitDepth", 8) < expected_bits:
+        warnings.append({"code": "bit_depth_reduced", "action": "检查导出格式和位深；PNG/TIFF 应保留输入精度"})
+    alpha_change = None
+    if source_alpha is not None and job.format != "jpg" and before_stats.get("size") == after_stats.get("size"):
+        if result_alpha is None:
+            result_alpha = Image.new("L", source_alpha.size, 255)
+        result_alpha = result_alpha.resize(source_alpha.size, Image.Resampling.LANCZOS)
+        alpha_diff = ImageChops.difference(source_alpha, result_alpha)
+        alpha_change = round(ImageStat.Stat(alpha_diff).mean[0], 3)
+        if alpha_diff.getextrema()[1] > 1:
+            warnings.append({"code": "transparency_changed", "action": "检查透明边缘与背景；重新导出 PNG/TIFF"})
     return {"source": job.src, "output": job.out, "settings": job.summary,
+            "source_preparation": job.source_metadata, "mean_alpha_change": alpha_change,
+            "original_source_stats": job.stats,
             "curves": job.curves, "before": before_stats, "after": after_stats,
             "mean_pixel_change": change, "neutral_shift": shift,
             "neutral_shift_method": "90th percentile of same-pixel chroma-range increase",
@@ -107,8 +143,8 @@ def _font(size):
     return ImageFont.load_default()
 
 
-def _tile(canvas, path, box):
-    rgb = tone.load_rgb(path, 1100)
+def _tile(canvas, path, box, background="#eeeeee"):
+    rgb = tone.load_rgb(path, 1100, background=background)
     left, top, width, height = box
     rgb.thumbnail((width, height), Image.Resampling.LANCZOS)
     canvas.paste(rgb, (left + (width - rgb.width) // 2, top + (height - rgb.height) // 2))
@@ -123,8 +159,10 @@ def contact_sheet(jobs, path, preview=False):
     font = _font(17)
     for row, job in enumerate(jobs):
         y = row * (cell_h + label_h)
-        draw.text((12, y + 8), "Original: " + Path(job.src).name[:58], fill="#111111", font=font)
-        _tile(canvas, job.src, (8, y + label_h, cell_w - 16, cell_h - 8))
+        label = "RAW render: " if Path(job.src).suffix.lower() in tone.RAW_EXTS else "Original: "
+        draw.text((12, y + 8), label + Path(job.src).name[:58], fill="#111111", font=font)
+        _tile(canvas, job.input_src or job.src, (8, y + label_h, cell_w - 16, cell_h - 8),
+              background="#ffffff" if not preview and job.format == "jpg" else "#eeeeee")
         if not preview:
             colour = job.summary.get("adjustments", {})
             label = "Edited: {0} | strength {1} | vibrance {2}".format(
@@ -147,6 +185,7 @@ def write_review(jobs, folder, preview=False):
     for job in jobs:
         if preview:
             records.append({"source": job.src, "planned_output": job.out, "before": job.stats,
+                            "source_preparation": job.source_metadata,
                             "planned_settings": job.summary, "curves": job.curves,
                             "status": "preview_only", "visual_review_required": True})
         elif job.status == "failed" or not os.path.isfile(job.out):
